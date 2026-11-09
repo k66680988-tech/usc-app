@@ -12,9 +12,16 @@ env:
   NDK_VERSION: 25.2.9519653
   ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
 
+# FIX(ci): fork repos default the GITHUB_TOKEN to read-only contents, which
+# makes creating a release fail with 403; grant write explicitly.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
+      # FIX(ci): don't cancel the other architecture when one matrix job fails
+      fail-fast: false
       matrix:
         arch: [arm64, arm]
         include:

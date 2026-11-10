@@ -1,0 +1,123 @@
+name: Android CI
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - '**'
+  workflow_dispatch:
+
+env:
+  NDK_VERSION: 25.2.9519653
+  ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
+
+# FIX(ci): fork repos default the GITHUB_TOKEN to read-only contents, which
+# makes creating a release fail with 403; grant write explicitly.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      # FIX(ci): don't cancel the other architecture when one matrix job fails
+      fail-fast: false
+      matrix:
+        arch: [arm64, arm]
+        include:
+          - arch: arm64
+            vcpkg_target_triplet: arm64-android
+            android_abi: arm64-v8a
+            ndk_platform_arch: aarch64-linux-android
+          - arch: arm
+            vcpkg_target_triplet: arm-neon-android
+            android_abi: armeabi-v7a
+            ndk_platform_arch: arm-linux-androideabi
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_TARGET_TRIPLET: ${{ matrix.vcpkg_target_triplet }}
+      ANDROID_ABI: ${{ matrix.android_abi }}
+      NDK_PLATFORM_ARCH: ${{ matrix.ndk_platform_arch }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+
+    - name: vcpkg
+      run: |
+        cd vcpkg
+        ./bootstrap-vcpkg.sh
+
+    # FIX(ci): allenevans/set-env uses the `set-env` workflow command that GitHub
+    # disabled in 2020; write to $GITHUB_ENV instead.
+    - name: Set env
+      run: |
+        echo "VCPKG_ROOT=${{ github.workspace }}/vcpkg" >> "$GITHUB_ENV"
+        echo "PROJECT_PATH=${{ github.workspace }}" >> "$GITHUB_ENV"
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v4
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+        cache: gradle
+
+    # FIX(ci): the old sdkmanager path (/usr/local/lib/android/sdk/tools/bin)
+    # no longer exists on ubuntu-latest runners, and sdkmanager's Java version
+    # requirements vary between runner images. Download the NDK zip directly
+    # instead - deterministic and Java-free. (r25c == 25.2.9519653)
+    # FIX(ci): the 700MB download sometimes gets connection-reset; retry with
+    # resume and verify the archive, and cache it between runs.
+    - name: Cache NDK
+      id: cache-ndk
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/lib/android/sdk/ndk/25.2.9519653
+        key: ndk-25.2.9519653
+
+    - name: Install ndk
+      if: steps.cache-ndk.outputs.cache-hit != 'true'
+      run: |
+        set -e
+        for i in 1 2 3 4 5; do
+          if curl -sSL --retry 3 -C - -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"; then
+            if unzip -tq /tmp/ndk.zip > /dev/null 2>&1; then
+              echo "NDK download OK (attempt $i)"
+              break
+            fi
+          fi
+          echo "NDK download failed (attempt $i), retrying in 10s..."
+          sleep 10
+        done
+        unzip -tq /tmp/ndk.zip > /dev/null
+        mkdir -p "$ANDROID_HOME/ndk"
+        rm -rf /tmp/ndk-extract
+        unzip -q /tmp/ndk.zip -d /tmp/ndk-extract
+        mv /tmp/ndk-extract/android-ndk-r25c "$ANDROID_HOME/ndk/25.2.9519653"
+
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    - name: Grant execute permission for build.sh
+      run: chmod +x build.sh
+
+    - name: Build with Gradle
+      run: ./build.sh
+
+    # FIX(ci): upload the APK as an artifact on every build, so branch pushes
+    # produce an installable APK without creating a release.
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: usc-app-${{ matrix.arch }}
+        path: app/build/outputs/apk/debug/app-debug.apk
+
+    - name: Upload files to a GitHub release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: app/build/outputs/apk/debug/app-debug.apk
+        asset_name: 'usc-app-${{ matrix.arch }}.apk'
+        tag: ${{ github.ref }}
+        overwrite: true
